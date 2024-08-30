@@ -1,0 +1,20 @@
+
+max: 57875
+max token: " "
+avg 4.545742
+
+per bytes
+max: 57875
+max token: " "
+avg 433.8196
+
+could merge with
+max: 137800
+avg 7.0770626
+size (kb): 512
+size (bits): 4194304
+
+occupied bits: 4194304
+used bits percentage: 100.0
+one bits: 373114
+avg 0.08895731

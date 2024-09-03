@@ -339,7 +339,7 @@ fn main() {
             merge_queue.resolve_level(merges_map);
         }
         println!("resolved_index: {:?}", merge_queue.tokens());
-        println!("detokenized: ");
+        print!("tokenized: ");
         let colors = [
             Color::Red,
             Color::Green,

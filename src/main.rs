@@ -3,10 +3,7 @@
 #![feature(allocator_api)]
 #![feature(portable_simd)]
 
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-};
+use std::{collections::HashMap, io::Read};
 
 use colored::{Color, Colorize};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -21,22 +18,29 @@ struct Merge {
     new_token: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct MergePriority {
+    level: u8,
     rank: u32,
     new_token: u32,
 }
 
 impl MergePriority {
     const DEFAULT: Self = Self {
+        level: 0,
         rank: u32::MAX,
         new_token: u32::MAX,
     };
+
+    fn is_default(&self) -> bool {
+        self.rank == u32::MAX
+    }
 }
 
-impl From<Merge> for MergePriority {
-    fn from(merge: Merge) -> Self {
+impl MergePriority {
+    fn from_merge(merge: Merge, level: u8) -> Self {
         MergePriority {
+            level,
             rank: merge.rank,
             new_token: merge.new_token,
         }
@@ -109,7 +113,6 @@ fn main() {
         .map(|merge| (merge.new_token, *merge))
         .collect();
 
-    let mut single_pass_merges: Vec<FxHashMap<[u32; 2], MergePriority>> = Vec::new();
     let mut current_pass_merges: Vec<Vec<usize>> = Vec::new();
     let mut stack = Vec::new();
     let mut tokens_used_to_create_merge = FxHashSet::default();
@@ -164,29 +167,39 @@ fn main() {
             current_pass_merges[0].push(merge_idx);
         }
     }
-    single_pass_merges.extend(current_pass_merges.drain(..).map(|i| {
-        i.into_iter()
-            .map(|i| {
-                let merge = &merges[i];
-                (merge.pair, (*merge).into())
+    let passes = current_pass_merges.len();
+    println!("total passes: {:?}", passes);
+    let single_pass_merges: FxHashMap<[u32; 2], MergePriority> = current_pass_merges
+        .drain(..)
+        .enumerate()
+        .flat_map(|(priority, v)| {
+            let merges = &merges;
+            v.into_iter().map(move |i| {
+                let merge = merges[i];
+                (merge.pair, MergePriority::from_merge(merge, priority as u8))
             })
-            .collect()
-    }));
+        })
+        .collect();
 
-    println!("total passes: {:?}", single_pass_merges.len());
+    #[derive(Clone, Copy)]
+    struct TokenData {
+        token: u32,
+        merge: MergePriority,
+    }
 
     struct MergeQueue<'a> {
         read_index: usize,
         resolved_index: usize,
         buffer_processed_end: usize,
-        tokens: &'a mut [u32],
+        tokens: &'a mut [TokenData],
         buffer_index: usize,
         buffer: [MergePriority; 10],
         first: u32,
+        last_unchanged_from_level: bool,
     }
 
     impl<'a> MergeQueue<'a> {
-        fn new(tokens: &'a mut [u32]) -> Self {
+        fn new(tokens: &'a mut [TokenData]) -> Self {
             Self {
                 buffer_processed_end: tokens.len(),
                 tokens,
@@ -195,12 +208,75 @@ fn main() {
                 buffer_index: 0,
                 buffer: [MergePriority::DEFAULT; 10],
                 first: u32::MAX,
+                last_unchanged_from_level: false,
             }
         }
 
-        fn add_unprocessed(&mut self, token: u32) {
-            self.tokens[self.resolved_index] = token;
-            self.resolved_index += 1;
+        fn add_unprocessed(
+            &mut self,
+            token: TokenData,
+            merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        ) {
+            Self::add_unprocessed_raw_and_maybe_calculate_merge(
+                self.tokens,
+                &mut self.resolved_index,
+                token,
+                merges_map,
+                self.last_unchanged_from_level,
+            );
+        }
+
+        fn add_unprocessed_raw_and_maybe_calculate_merge(
+            tokens: &mut [TokenData],
+            resolved_index: &mut usize,
+            token: TokenData,
+            merges_map: &FxHashMap<[u32; 2], MergePriority>,
+            last_unchanged_from_level: bool,
+        ) {
+            if last_unchanged_from_level {
+                Self::add_unprocessed_raw(tokens, resolved_index, token);
+            } else {
+                Self::add_unprocessed_raw_and_calculate_merge(
+                    tokens,
+                    resolved_index,
+                    token.token,
+                    merges_map,
+                );
+            }
+        }
+
+        fn add_unprocessed_raw_and_calculate_merge(
+            tokens: &mut [TokenData],
+            resolved_index: &mut usize,
+            token: u32,
+            merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        ) {
+            let priority = if let Some(last) = tokens[..*resolved_index].last() {
+                match merges_map.get(&[last.token, token]) {
+                    Some(merge) => *merge,
+                    None => MergePriority::DEFAULT,
+                }
+            } else {
+                MergePriority::DEFAULT
+            };
+
+            Self::add_unprocessed_raw(
+                tokens,
+                resolved_index,
+                TokenData {
+                    token,
+                    merge: priority,
+                },
+            );
+        }
+
+        fn add_unprocessed_raw(
+            tokens: &mut [TokenData],
+            resolved_index: &mut usize,
+            token: TokenData,
+        ) {
+            tokens[*resolved_index] = token;
+            *resolved_index += 1;
         }
 
         fn push_buffer(&mut self, merge: MergePriority, first: u32) {
@@ -211,9 +287,10 @@ fn main() {
             self.buffer_index += 1;
         }
 
-        fn resolve_level(&mut self, merges_map: &FxHashMap<[u32; 2], MergePriority>) {
+        fn resolve_level(&mut self, merges_map: &FxHashMap<[u32; 2], MergePriority>, i: u8) {
             self.read_index = 0;
             self.resolved_index = 0;
+            self.last_unchanged_from_level = true;
             debug_assert!(self.buffer_index == 0);
 
             while self.read_index < self.buffer_processed_end {
@@ -226,33 +303,33 @@ fn main() {
                 } else {
                     // Just add the last token to the buffer unprocessed
                     if self.buffer_index == 0 {
-                        self.add_unprocessed(current_token);
+                        self.add_unprocessed(current_token, merges_map);
+                        self.last_unchanged_from_level = true;
                     } else {
-                        self.flush();
+                        self.flush(merges_map);
                     }
                     continue;
                 };
-                let merge = merges_map.get(&[current_token, next_token]);
-                match merge {
-                    Some(merge) => {
-                        // If the new merge is a lower rank than the previous merge, do the previous merge instead
-                        match self.buffer[..self.buffer_index].last() {
-                            Some(prev_merge) if prev_merge.rank < merge.rank => {
-                                // Flush the merge buffer
-                                self.flush();
-                            }
-                            _ => {
-                                // Otherwise add the merge to the buffer
-                                self.push_buffer(*merge, current_token);
-                            }
-                        }
+                let merge = next_token.merge;
+                // If the level of the merge is not the current level, do not merge yet
+                if merge.level != i || merge.is_default() {
+                    // Flush the merge buffer and add the current token unprocessed to the buffer
+                    if self.buffer_index == 0 {
+                        self.add_unprocessed(current_token, merges_map);
+                        self.last_unchanged_from_level = true;
+                    } else {
+                        self.flush(merges_map);
                     }
-                    None => {
-                        // Flush the merge buffer and add the current token unprocessed to the buffer
-                        if self.buffer_index == 0 {
-                            self.add_unprocessed(current_token);
-                        } else {
-                            self.flush();
+                } else {
+                    // If the new merge is a lower rank than the previous merge, do the previous merge instead
+                    match self.buffer[..self.buffer_index].last() {
+                        Some(prev_merge) if prev_merge.rank < merge.rank => {
+                            // Flush the merge buffer
+                            self.flush(merges_map);
+                        }
+                        _ => {
+                            // Otherwise add the merge to the buffer
+                            self.push_buffer(merge, current_token.token);
                         }
                     }
                 }
@@ -261,7 +338,7 @@ fn main() {
             self.buffer_processed_end = self.resolved_index;
         }
 
-        fn flush(&mut self) {
+        fn flush(&mut self, merges_map: &FxHashMap<[u32; 2], MergePriority>) {
             let len = self.buffer_index;
             if len == 0 {
                 return;
@@ -269,21 +346,33 @@ fn main() {
 
             let even_len = len % 2 == 0;
             if even_len {
-                self.add_unprocessed(self.first);
+                Self::add_unprocessed_raw_and_calculate_merge(
+                    self.tokens,
+                    &mut self.resolved_index,
+                    self.first,
+                    merges_map,
+                );
+                self.last_unchanged_from_level = true;
             }
             for merge in self.buffer[..self.buffer_index]
                 .iter()
                 .skip(even_len as usize)
                 .step_by(2)
             {
-                self.tokens[self.resolved_index] = merge.new_token;
-                self.resolved_index += 1;
+                let token = merge.new_token;
+                Self::add_unprocessed_raw_and_calculate_merge(
+                    self.tokens,
+                    &mut self.resolved_index,
+                    token,
+                    merges_map,
+                );
+                self.last_unchanged_from_level = false;
             }
             self.buffer_index = 0;
         }
 
-        fn tokens(&self) -> &[u32] {
-            &self.tokens[..self.resolved_index]
+        fn tokens(&self) -> impl Iterator<Item = u32> + '_ {
+            self.tokens[..self.resolved_index].iter().map(|t| t.token)
         }
     }
 
@@ -300,10 +389,30 @@ fn main() {
     input.read_to_string(&mut text).unwrap();
 
     let start = std::time::Instant::now();
-    let mut input_tokens: Vec<_> = text.bytes().map(|b| byte_to_token[b as usize]).collect();
+    let mut input_tokens: Vec<_> = text
+        .bytes()
+        .map(|b| {
+            let token = byte_to_token[b as usize];
+            TokenData {
+                token,
+                merge: MergePriority::DEFAULT,
+            }
+        })
+        .collect();
+
+    for i in 0..input_tokens.len() - 1 {
+        let first = input_tokens[i].token;
+        let second = input_tokens[i + 1].token;
+        let priority = match single_pass_merges.get(&[first, second]) {
+            Some(merge) => *merge,
+            None => MergePriority::DEFAULT,
+        };
+        input_tokens[i + 1].merge = priority;
+    }
+
     let mut merge_queue = MergeQueue::new(&mut input_tokens);
-    for merges_map in &single_pass_merges {
-        merge_queue.resolve_level(merges_map);
+    for i in 0..passes as u8 {
+        merge_queue.resolve_level(&single_pass_merges, i);
     }
     println!("time to resolve fast-bpe: {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file("tokenizer.json").unwrap();
@@ -313,7 +422,7 @@ fn main() {
     // pretty_print_tokens(merge_queue.tokens(), &tokens);
 }
 
-fn pretty_print_tokens(resolved: &[u32], tokens: &[Vec<u8>]) {
+fn pretty_print_tokens(resolved: impl Iterator<Item = u32>, tokens: &[Vec<u8>]) {
     let colors = [
         Color::Red,
         Color::Green,
@@ -323,10 +432,7 @@ fn pretty_print_tokens(resolved: &[u32], tokens: &[Vec<u8>]) {
         Color::Cyan,
     ];
     let mut i = 0;
-    for token in resolved
-        .iter()
-        .map(|t| std::str::from_utf8(&tokens[*t as usize]).unwrap())
-    {
+    for token in resolved.map(|t| std::str::from_utf8(&tokens[t as usize]).unwrap()) {
         i = (i + 1) % colors.len();
         print!("{}", token.color(colors[i]));
     }

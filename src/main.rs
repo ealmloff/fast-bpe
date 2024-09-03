@@ -2,8 +2,9 @@
 #![feature(allocator_api)]
 #![feature(portable_simd)]
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Write};
 
+use colored::{Color, Colorize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,16 +151,12 @@ fn main() {
 
     let mut single_pass_merges: Vec<FxHashMap<[u32; 2], MergePriority>> = Vec::new();
     let mut current_pass_merges: Vec<Vec<usize>> = Vec::new();
+    let mut stack = Vec::new();
+    let mut tokens_used_to_create_merge = FxHashSet::default();
 
     'o: for (merge_idx, merge) in merges.iter().enumerate() {
-        println!(
-            "{:.2}% steps {}",
-            (merge_idx as f32 / merges.len() as f32) * 100.,
-            current_pass_merges.len()
-        );
-
-        let mut tokens_used_to_create_merge = FxHashSet::default();
-        let mut stack = Vec::new();
+        tokens_used_to_create_merge.clear();
+        stack.clear();
         stack.extend(merge.pair);
         while let Some(token) = stack.pop() {
             if let Some(merge) = token_to_merge.get(&token) {
@@ -171,16 +168,16 @@ fn main() {
         }
 
         let mut index = current_pass_merges.len();
-        let mut ends_seen = FxHashSet::default();
-        let mut starts_seen = FxHashSet::default();
         while index > 0 {
             index -= 1;
+
+            let mut stop_here = false;
 
             // Check if the new token is a prefix of any existing merge or a postfix of any existing merge. If it is, use the last match after that.
             for other in current_pass_merges[index].iter().copied() {
                 let other_merge = &merges[other];
-                starts_seen.insert(other_merge.pair[0]);
-                ends_seen.insert(other_merge.pair[1]);
+                stop_here |= other_merge.pair.contains(&merge.pair[0])
+                    || other_merge.pair.contains(&merge.pair[1]);
                 if tokens_used_to_create_merge.contains(&other_merge.new_token) {
                     if index < current_pass_merges.len() - 1 {
                         // If it does conflict, but we fit in at least one previous merge, add the merge to the previous merge
@@ -194,7 +191,7 @@ fn main() {
             }
 
             // If the new token would eat a token that is used by this layer, stop here. This is a conflict.
-            if starts_seen.contains(&merge.pair[1]) || ends_seen.contains(&merge.pair[0]) {
+            if stop_here {
                 current_pass_merges[index].push(merge_idx);
                 continue 'o;
             }
@@ -207,7 +204,6 @@ fn main() {
             current_pass_merges[0].push(merge_idx);
         }
     }
-    println!("current_pass_merges: {:?}", current_pass_merges);
     single_pass_merges.extend(current_pass_merges.drain(..).map(|i| {
         i.into_iter()
             .map(|i| {
@@ -217,13 +213,6 @@ fn main() {
             .collect()
     }));
 
-    println!(
-        "passes: {:?}",
-        single_pass_merges
-            .iter()
-            .map(|x| x.len())
-            .collect::<Vec<_>>()
-    );
     println!("total passes: {:?}", single_pass_merges.len());
 
     struct MergeQueue<'a> {
@@ -248,10 +237,6 @@ fn main() {
         }
 
         fn add_unprocessed(&mut self, token: u32) {
-            println!(
-                "adding unprocessed token: {:?} @ {:?}",
-                token, self.resolved_index
-            );
             self.tokens[self.resolved_index] = token;
             self.resolved_index += 1;
         }
@@ -324,10 +309,6 @@ fn main() {
                 self.add_unprocessed(self.first);
             }
             for merge in self.buffer.iter().skip(even_len as usize).step_by(2) {
-                println!(
-                    "adding merge: {:?} @ {:?}",
-                    merge.new_token, self.resolved_index
-                );
                 self.tokens[self.resolved_index] = merge.new_token;
                 self.resolved_index += 1;
             }
@@ -348,26 +329,35 @@ fn main() {
 
     loop {
         let mut text = String::new();
+        print!("> ");
+        std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut text).unwrap();
         let text = text.trim();
         let mut input_tokens: Vec<_> = text.bytes().map(|b| byte_to_token[b as usize]).collect();
         let mut merge_queue = MergeQueue::new(&mut input_tokens);
         for merges_map in &single_pass_merges {
             merge_queue.resolve_level(merges_map);
-            println!("resolved_index: {:?}", merge_queue.tokens());
-            println!(
-                "detokenized: {:?}",
-                merge_queue
-                    .tokens()
-                    .iter()
-                    .map(|t| {
-                        tokens
-                            .get(*t as usize)
-                            .map(|t| std::str::from_utf8(t).unwrap())
-                    })
-                    .collect::<Vec<_>>()
-            );
         }
+        println!("resolved_index: {:?}", merge_queue.tokens());
+        println!("detokenized: ");
+        let colors = [
+            Color::Red,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+        ];
+        let mut i = 0;
+        for token in merge_queue
+            .tokens()
+            .iter()
+            .map(|t| std::str::from_utf8(tokens.get(*t as usize).unwrap()).unwrap())
+        {
+            i = (i + 1) % colors.len();
+            print!("{}", token.color(colors[i]));
+        }
+        println!();
     }
 }
 

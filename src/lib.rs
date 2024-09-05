@@ -15,28 +15,24 @@ pub struct Merge {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MergePriority {
     level: u8,
-    rank: u32,
+    rank: u16,
     new_token: u32,
 }
 
 impl MergePriority {
     const DEFAULT: Self = Self {
-        level: 0,
-        rank: u32::MAX,
+        level: u8::MAX,
+        rank: u16::MAX,
         new_token: u32::MAX,
     };
-
-    fn is_default(&self) -> bool {
-        self.rank == u32::MAX
-    }
 }
 
 impl MergePriority {
-    fn from_merge(merge: Merge, level: u8) -> Self {
+    fn new(new_token: u32, rank: u16, level: u8) -> Self {
         MergePriority {
             level,
-            rank: merge.rank,
-            new_token: merge.new_token,
+            rank,
+            new_token,
         }
     }
 }
@@ -57,8 +53,11 @@ fn normalize_token(token: &str) -> String {
     token.replace('Ġ', " ")
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct FastBPETokenizer {
+    passes: u8,
     tokens: Vec<Vec<u8>>,
+    #[serde(with = "serde_big_array::BigArray")]
     byte_to_token: [u32; 256],
     single_pass_merges: FxHashMap<[u32; 2], MergePriority>,
 }
@@ -80,8 +79,6 @@ impl FastBPETokenizer {
         let mut vocab_sorted: Vec<_> = vocab.iter().map(|(k, v)| (k.clone(), *v)).collect();
         vocab_sorted.sort_by_key(|(_, v)| *v);
         let tokens: Vec<_> = vocab_sorted.into_iter().map(|(k, _)| k).collect();
-
-        println!("There are {} tokens", tokens.len());
 
         let merges: Vec<_> = deserialized
             .merges
@@ -172,11 +169,19 @@ impl FastBPETokenizer {
         let single_pass_merges: FxHashMap<[u32; 2], MergePriority> = current_pass_merges
             .drain(..)
             .enumerate()
-            .flat_map(|(priority, v)| {
+            .flat_map(|(priority, mut v)| {
+                v.sort_by_key(|m| merges[*m].rank);
                 let merges = &merges;
-                v.into_iter().map(move |i| {
+                v.into_iter().enumerate().map(move |(rank, i)| {
                     let merge = merges[i];
-                    (merge.pair, MergePriority::from_merge(merge, priority as u8))
+                    (
+                        merge.pair,
+                        MergePriority::new(
+                            merge.new_token,
+                            rank.try_into().unwrap(),
+                            priority as u8,
+                        ),
+                    )
                 })
             })
             .collect();
@@ -188,10 +193,17 @@ impl FastBPETokenizer {
             }
         }
 
+        let passes = single_pass_merges
+            .values()
+            .map(|v| v.level)
+            .max()
+            .unwrap_or_default();
+
         Self {
             byte_to_token,
             single_pass_merges,
             tokens,
+            passes,
         }
     }
 }
@@ -200,16 +212,20 @@ pub struct LayersUsed([usize; 256]);
 
 impl LayersUsed {
     fn new() -> Self {
-        Self([usize::MAX; 256])
+        Self([0; 256])
     }
 
-    fn set(&mut self, layer: u8, index: usize) {
-        let mutable = unsafe { self.0.get_unchecked_mut(index) };
-        *mutable = (*mutable).min(layer as usize);
+    fn set(&mut self, layer: u8, index: usize, len: usize) {
+        let index_from_end = len - index;
+        let mutable = unsafe { self.0.get_unchecked_mut(layer as usize) };
+        *mutable = (*mutable).max(index_from_end);
     }
 
-    fn first_used_index(&self, layer: u8) -> usize {
-        unsafe { *self.0.get_unchecked(layer as usize) }
+    fn first_used_index(&self, layer: u8, len: usize) -> usize {
+        let index_from_end = unsafe { *self.0.get_unchecked(layer as usize) };
+        len.saturating_sub(index_from_end)
+        // index = len - offset;
+        // offset = len - index;
     }
 }
 
@@ -260,6 +276,7 @@ impl MergeQueue {
         tokens: &mut [TokenData],
         token: TokenData,
         merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        len: usize,
         layers_used: &mut LayersUsed,
     ) {
         Self::add_unprocessed_raw_and_maybe_calculate_merge(
@@ -267,6 +284,7 @@ impl MergeQueue {
             &mut self.resolved_index,
             token,
             merges_map,
+            len,
             layers_used,
             self.last_unchanged_from_level,
         );
@@ -277,6 +295,7 @@ impl MergeQueue {
         resolved_index: &mut usize,
         token: TokenData,
         merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        len: usize,
         layers_used: &mut LayersUsed,
         last_unchanged_from_level: bool,
     ) {
@@ -288,6 +307,7 @@ impl MergeQueue {
                 resolved_index,
                 token.token,
                 merges_map,
+                len,
                 layers_used,
             );
         }
@@ -298,16 +318,20 @@ impl MergeQueue {
         resolved_index: &mut usize,
         token: u32,
         merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        len: usize,
         layers_used: &mut LayersUsed,
     ) {
-        let index = *resolved_index - 1;
-        let priority = if let Some(last) = tokens.get(index) {
-            match merges_map.get(&[last.token, token]) {
-                Some(merge) => {
-                    layers_used.set(merge.level, index);
-                    *merge
+        let priority = if let Some(index) = resolved_index.checked_sub(1) {
+            if let Some(last) = tokens.get(index) {
+                match merges_map.get(&[last.token, token]) {
+                    Some(merge) => {
+                        layers_used.set(merge.level, index, len);
+                        *merge
+                    }
+                    None => MergePriority::DEFAULT,
                 }
-                None => MergePriority::DEFAULT,
+            } else {
+                MergePriority::DEFAULT
             }
         } else {
             MergePriority::DEFAULT
@@ -334,9 +358,7 @@ impl MergeQueue {
         if self.buffer_index == 0 {
             self.first = first;
         }
-        unsafe {
-            *self.buffer.get_unchecked_mut(self.buffer_index) = merge;
-        }
+        self.buffer[self.buffer_index] = merge;
         self.buffer_index += 1;
     }
 
@@ -345,22 +367,22 @@ impl MergeQueue {
         tokens: &mut [TokenData],
         bytes: &[u8],
         tokenizer: &FastBPETokenizer,
-    ) {
+    ) -> usize {
         assert!(tokens.len() >= bytes.len());
         let mut buffer_processed_end = tokens.len();
         let mut layers_used = LayersUsed::new();
-        let mut max_pass = 0;
         for (i, b) in bytes.iter().enumerate() {
             let token = unsafe { *tokenizer.byte_to_token.get_unchecked(*b as usize) };
             let data = TokenData {
                 token,
-                merge: if let Some(&next) = bytes.get(i + 1) {
-                    match tokenizer.single_pass_merges.get(&[token, unsafe {
-                        *tokenizer.byte_to_token.get_unchecked(next as usize)
-                    }]) {
+                merge: if let Some(index) = i.checked_sub(1) {
+                    let prev = bytes[index];
+                    match tokenizer
+                        .single_pass_merges
+                        .get(&[tokenizer.byte_to_token[prev as usize], token])
+                    {
                         Some(merge) => {
-                            max_pass = max_pass.max(merge.level);
-                            layers_used.set(merge.level, i);
+                            layers_used.set(merge.level, index, bytes.len());
                             *merge
                         }
                         None => MergePriority::DEFAULT,
@@ -374,8 +396,7 @@ impl MergeQueue {
             }
         }
 
-        for i in 0..=max_pass {
-            println!("buffer_processed_end: {buffer_processed_end}");
+        for i in 0..=tokenizer.passes {
             self.resolve_level(
                 &mut buffer_processed_end,
                 tokens,
@@ -384,6 +405,8 @@ impl MergeQueue {
                 i,
             );
         }
+
+        buffer_processed_end
     }
 
     fn resolve_level(
@@ -395,16 +418,14 @@ impl MergeQueue {
         level: u8,
     ) {
         self.last_unchanged_from_level = true;
+        self.buffer_index = 0;
 
-        assert!(*buffer_processed_end <= tokens.len());
         if *buffer_processed_end <= 1 {
             return;
         }
 
-        let start = layers_used.first_used_index(level);
-        println!("start: {start} vs {buffer_processed_end}");
-        self.resolved_index = start.saturating_sub(1);
-        self.buffer_index = start;
+        let start = layers_used.first_used_index(level, *buffer_processed_end);
+        self.resolved_index = start;
         if start >= *buffer_processed_end {
             return;
         }
@@ -412,26 +433,35 @@ impl MergeQueue {
         for read_index in start..*buffer_processed_end - 1 {
             let this_token_index = read_index;
             let next_token_index = read_index + 1;
-            let current_token = unsafe { *tokens.get_unchecked(this_token_index) };
             let next_token = unsafe { *tokens.get_unchecked(next_token_index) };
             let merge = next_token.merge;
             // If the level of the merge is not the current level, do not merge yet
-            if merge.level != level || merge.is_default() {
+            if merge.level != level {
                 // Flush the merge buffer and add the current token unprocessed to the buffer
                 if self.buffer_index == 0 {
-                    self.add_unprocessed(tokens, current_token, merges_map, layers_used);
+                    let current_token = unsafe { *tokens.get_unchecked(this_token_index) };
+                    self.add_unprocessed(
+                        tokens,
+                        current_token,
+                        merges_map,
+                        *buffer_processed_end,
+                        layers_used,
+                    );
                     self.last_unchanged_from_level = true;
                 } else {
-                    self.flush(tokens, merges_map, layers_used);
+                    self.flush(tokens, merges_map, *buffer_processed_end, layers_used);
                 }
             } else {
                 // If the new merge is a lower rank than the previous merge, do the previous merge instead
-                match self.buffer.get(self.buffer_index - 1) {
+                match (self.buffer_index > 0)
+                    .then(|| unsafe { self.buffer.get_unchecked(self.buffer_index - 1) })
+                {
                     Some(prev_merge) if prev_merge.rank < merge.rank => {
                         // Flush the merge buffer
-                        self.flush(tokens, merges_map, layers_used);
+                        self.flush(tokens, merges_map, *buffer_processed_end, layers_used);
                     }
                     _ => {
+                        let current_token = unsafe { *tokens.get_unchecked(this_token_index) };
                         // Otherwise add the merge to the buffer
                         self.push_buffer(merge, current_token.token);
                     }
@@ -445,11 +475,12 @@ impl MergeQueue {
                 tokens,
                 unsafe { *tokens.get_unchecked(*buffer_processed_end - 1) },
                 merges_map,
+                *buffer_processed_end,
                 layers_used,
             );
             self.last_unchanged_from_level = true;
         } else {
-            self.flush(tokens, merges_map, layers_used);
+            self.flush(tokens, merges_map, *buffer_processed_end, layers_used);
         }
 
         *buffer_processed_end = self.resolved_index;
@@ -459,6 +490,7 @@ impl MergeQueue {
         &mut self,
         tokens: &mut [TokenData],
         merges_map: &FxHashMap<[u32; 2], MergePriority>,
+        tokens_len: usize,
         layers_used: &mut LayersUsed,
     ) {
         let len = self.buffer_index;
@@ -473,6 +505,7 @@ impl MergeQueue {
                 &mut self.resolved_index,
                 self.first,
                 merges_map,
+                tokens_len,
                 layers_used,
             );
             self.last_unchanged_from_level = true;
@@ -486,6 +519,7 @@ impl MergeQueue {
                 &mut self.resolved_index,
                 token,
                 merges_map,
+                tokens_len,
                 layers_used,
             );
             self.last_unchanged_from_level = false;
@@ -509,6 +543,7 @@ pub fn pretty_print_tokens(resolved: impl Iterator<Item = u32>, tokenizer: &Fast
         i = (i + 1) % colors.len();
         print!("{}", token.color(colors[i]));
     }
+    println!()
 }
 
 // a,b e,f b,c d,ef

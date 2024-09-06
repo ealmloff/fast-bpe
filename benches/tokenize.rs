@@ -62,11 +62,11 @@ pub fn tokenize_large(c: &mut Criterion) {
     // read the first argument as a file path to read from
     let mut group = c.benchmark_group("tokenize-large");
     group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Linear));
-    for size in 1..=5 {
+    for size in 1..=6 {
         let size = 10_usize.pow(size as u32);
         group.throughput(Throughput::Bytes(size as u64));
         group.warm_up_time(Duration::from_millis(100));
-        group.measurement_time(Duration::from_secs(5));
+        group.measurement_time(Duration::from_secs(10));
         let text = (0..)
             .flat_map(|_| text.chars())
             .take(size)
@@ -87,6 +87,7 @@ pub fn tokenize_large(c: &mut Criterion) {
             .take(size)
             .map(char::from)
             .collect::<String>();
+        assert_eq!(text.len(), size);
         group.bench_with_input(BenchmarkId::new("Fast-Word", size), &text, |b, text| {
             let mut input_tokens = Vec::new();
             let mut merge_queue = MergeQueue::new();

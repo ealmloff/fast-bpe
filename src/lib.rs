@@ -44,12 +44,6 @@ struct SerializedModel {
     merges: Vec<String>,
 }
 
-// There should be something like a "max spread"
-// which is the window that a merge can effect?
-
-// [a, b, c]
-// ab, bc
-
 fn normalize_token(token: &str) -> String {
     token.replace('Ġ', " ")
 }
@@ -231,6 +225,15 @@ impl FastBPETokenizer {
             passes,
             regex,
         }
+    }
+
+    pub fn detokenize<'a>(
+        &'a self,
+        tokens: impl IntoIterator<Item = u32> + 'a,
+    ) -> impl Iterator<Item = &[u8]> + 'a {
+        tokens
+            .into_iter()
+            .map(move |token| self.tokens[token as usize].as_slice())
     }
 }
 
@@ -566,49 +569,12 @@ pub fn pretty_print_tokens(resolved: impl Iterator<Item = u32>, tokenizer: &Fast
         Color::Cyan,
     ];
     let mut i = 0;
-    for token in
-        resolved.filter_map(|t| std::str::from_utf8(tokenizer.tokens.get(t as usize)?).ok())
+    for token in tokenizer
+        .detokenize(resolved)
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
     {
         i = (i + 1) % colors.len();
         print!("{}", token.color(colors[i]));
     }
     println!()
 }
-
-// a,b e,f b,c d,ef
-
-// | a   | b   | c   | d   | e   | f   |
-// | --- | --- | --- | --- | --- | --- |
-// |     | ab  | c   | d   | e   | f   |
-// |     | ab  | c   | d   | ef  |     |
-// |     | ab  | c   | def |     |     |
-// |     |     |     |     |     |     |
-
-// | a   | b   | c   | d   | e   | f   |
-// | --- | --- | --- | --- | --- | --- |
-// | a   | b   | c   | d   | ef  |     |
-// | a   | b   | c   | def |     |     |
-// |     | ab  | c   | def |     |     |
-// |     |     |     |     |     |     |
-// - Walk through the level, looking at adjacent merges
-// 	- If the merge score decreases in the next merge, keep going
-// 	- Otherwise, we can merge immediately?
-
-// | a   | b   | c   | d   | e   | f   | a   |
-// | --- | --- | --- | --- | --- | --- | --- |
-// |     | ab  | c   | d   | ef  |     |     |
-// |     | ab  | c   |     |     |     |     |
-// |     |     |     |     |     |     |     |
-// |     |     |     |     |     |     |     |
-// Different scan levels of merges?
-// - Each level applies a few merges in waves of the bpe tree
-// - Small levels have a much smaller window
-// 	- What is the window for the first level merge with just byte level?
-// 	- 2? No because the second token might need to merge with the token after that because
-// - Should work for a well defined bpe (components of merge have a higher priority than the merge itself?)
-
-// What do "overlapping" merge rules look like?
-// One merge could eat bytes that another merge may use.
-// e.g. "a,b" and "b,c" are overlapping
-// but "a,b" and "c,d" are not
-// Prefix/postfix encoding?

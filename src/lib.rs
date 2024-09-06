@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use colored::{Color, Colorize};
+use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +54,21 @@ fn normalize_token(token: &str) -> String {
     token.replace('Ġ', " ")
 }
 
+fn serialize_regex<S>(regex: &Regex, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(regex.as_str())
+}
+
+fn deserialize_regex<'de, D>(deserializer: D) -> Result<Regex, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Regex::new(&s).map_err(serde::de::Error::custom)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct FastBPETokenizer {
     passes: u8,
@@ -60,11 +76,20 @@ pub struct FastBPETokenizer {
     #[serde(with = "serde_big_array::BigArray")]
     byte_to_token: [u32; 256],
     single_pass_merges: FxHashMap<[u32; 2], MergePriority>,
+    #[serde(
+        serialize_with = "serialize_regex",
+        deserialize_with = "deserialize_regex"
+    )]
+    regex: Regex,
 }
 
 impl FastBPETokenizer {
     pub fn load_from_bytes(bytes: &[u8]) -> Self {
         let json = serde_json::from_slice::<Value>(bytes).unwrap();
+        let pretokenizer = json["pre_tokenizer"].clone();
+        let sequence = pretokenizer["pretokenizers"][0].clone();
+        let pattern = sequence["pattern"]["Regex"].as_str().unwrap();
+        let regex = Regex::new(pattern).unwrap();
         let model = json["model"].clone();
         let deserialized = serde_json::from_value::<SerializedModel>(model).unwrap();
 
@@ -204,6 +229,7 @@ impl FastBPETokenizer {
             single_pass_merges,
             tokens,
             passes,
+            regex,
         }
     }
 }
@@ -224,8 +250,6 @@ impl LayersUsed {
     fn first_used_index(&self, layer: u8, len: usize) -> usize {
         let index_from_end = unsafe { *self.0.get_unchecked(layer as usize) };
         len.saturating_sub(index_from_end)
-        // index = len - offset;
-        // offset = len - index;
     }
 }
 
@@ -248,8 +272,7 @@ impl TokenData {
 
 pub struct MergeQueue {
     resolved_index: usize,
-    buffer_index: usize,
-    buffer: [MergePriority; 10],
+    buffer: Vec<MergePriority>,
     first: u32,
     last_unchanged_from_level: bool,
 }
@@ -264,8 +287,7 @@ impl MergeQueue {
     pub fn new() -> Self {
         Self {
             resolved_index: 0,
-            buffer_index: 0,
-            buffer: [MergePriority::DEFAULT; 10],
+            buffer: Vec::new(),
             first: u32::MAX,
             last_unchanged_from_level: false,
         }
@@ -355,58 +377,65 @@ impl MergeQueue {
     }
 
     fn push_buffer(&mut self, merge: MergePriority, first: u32) {
-        if self.buffer_index == 0 {
+        if self.buffer.is_empty() {
             self.first = first;
         }
-        self.buffer[self.buffer_index] = merge;
-        self.buffer_index += 1;
+        self.buffer.push(merge);
     }
 
     pub fn resolve(
         &mut self,
-        tokens: &mut [TokenData],
-        bytes: &[u8],
+        tokens: &mut Vec<TokenData>,
+        input: &str,
         tokenizer: &FastBPETokenizer,
     ) -> usize {
-        assert!(tokens.len() >= bytes.len());
-        let mut buffer_processed_end = tokens.len();
-        let mut layers_used = LayersUsed::new();
-        for (i, b) in bytes.iter().enumerate() {
-            let token = unsafe { *tokenizer.byte_to_token.get_unchecked(*b as usize) };
-            let data = TokenData {
-                token,
-                merge: if let Some(index) = i.checked_sub(1) {
-                    let prev = bytes[index];
-                    match tokenizer
-                        .single_pass_merges
-                        .get(&[tokenizer.byte_to_token[prev as usize], token])
-                    {
-                        Some(merge) => {
-                            layers_used.set(merge.level, index, bytes.len());
-                            *merge
+        let mut fill_index = 0;
+        for regex_match in tokenizer.regex.find_iter(input) {
+            let mut buffer_processed_end = regex_match.len();
+            tokens.resize(fill_index + buffer_processed_end, TokenData::DEFAULT);
+            let token = regex_match.as_str();
+            let mut layers_used = LayersUsed::new();
+            let bytes = token.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                let token = unsafe { *tokenizer.byte_to_token.get_unchecked(b as usize) };
+                let data = TokenData {
+                    token,
+                    merge: if let Some(index) = i.checked_sub(1) {
+                        let prev = bytes[index];
+                        match tokenizer
+                            .single_pass_merges
+                            .get(&[tokenizer.byte_to_token[prev as usize], token])
+                        {
+                            Some(merge) => {
+                                layers_used.set(merge.level, index, bytes.len());
+                                *merge
+                            }
+                            None => MergePriority::DEFAULT,
                         }
-                        None => MergePriority::DEFAULT,
-                    }
-                } else {
-                    MergePriority::DEFAULT
-                },
-            };
-            unsafe {
-                *tokens.get_unchecked_mut(i) = data;
+                    } else {
+                        MergePriority::DEFAULT
+                    },
+                };
+                unsafe {
+                    *tokens.get_unchecked_mut(fill_index + i) = data;
+                }
             }
+
+            let token_buffer = &mut tokens[fill_index..];
+            for i in 0..=tokenizer.passes {
+                self.resolve_level(
+                    &mut buffer_processed_end,
+                    token_buffer,
+                    &tokenizer.single_pass_merges,
+                    &mut layers_used,
+                    i,
+                );
+            }
+
+            fill_index += buffer_processed_end;
         }
 
-        for i in 0..=tokenizer.passes {
-            self.resolve_level(
-                &mut buffer_processed_end,
-                tokens,
-                &tokenizer.single_pass_merges,
-                &mut layers_used,
-                i,
-            );
-        }
-
-        buffer_processed_end
+        fill_index
     }
 
     fn resolve_level(
@@ -418,7 +447,7 @@ impl MergeQueue {
         level: u8,
     ) {
         self.last_unchanged_from_level = true;
-        self.buffer_index = 0;
+        self.buffer.clear();
 
         if *buffer_processed_end <= 1 {
             return;
@@ -438,7 +467,7 @@ impl MergeQueue {
             // If the level of the merge is not the current level, do not merge yet
             if merge.level != level {
                 // Flush the merge buffer and add the current token unprocessed to the buffer
-                if self.buffer_index == 0 {
+                if self.buffer.is_empty() {
                     let current_token = unsafe { *tokens.get_unchecked(this_token_index) };
                     self.add_unprocessed(
                         tokens,
@@ -453,9 +482,7 @@ impl MergeQueue {
                 }
             } else {
                 // If the new merge is a lower rank than the previous merge, do the previous merge instead
-                match (self.buffer_index > 0)
-                    .then(|| unsafe { self.buffer.get_unchecked(self.buffer_index - 1) })
-                {
+                match self.buffer.last() {
                     Some(prev_merge) if prev_merge.rank < merge.rank => {
                         // Flush the merge buffer
                         self.flush(tokens, merges_map, *buffer_processed_end, layers_used);
@@ -470,7 +497,7 @@ impl MergeQueue {
         }
 
         // Just add the last token to the buffer unprocessed
-        if self.buffer_index == 0 {
+        if self.buffer.is_empty() {
             self.add_unprocessed(
                 tokens,
                 unsafe { *tokens.get_unchecked(*buffer_processed_end - 1) },
@@ -493,7 +520,7 @@ impl MergeQueue {
         tokens_len: usize,
         layers_used: &mut LayersUsed,
     ) {
-        let len = self.buffer_index;
+        let len = self.buffer.len();
         if len == 0 {
             return;
         }
@@ -511,7 +538,7 @@ impl MergeQueue {
             self.last_unchanged_from_level = true;
         }
         let mut index = even_len as usize;
-        while index < self.buffer_index {
+        while index < self.buffer.len() {
             let merge = unsafe { self.buffer.get_unchecked(index) };
             let token = merge.new_token;
             Self::add_unprocessed_raw_and_calculate_merge(
@@ -525,7 +552,7 @@ impl MergeQueue {
             self.last_unchanged_from_level = false;
             index += 2;
         }
-        self.buffer_index = 0;
+        self.buffer.clear();
     }
 }
 
@@ -539,7 +566,9 @@ pub fn pretty_print_tokens(resolved: impl Iterator<Item = u32>, tokenizer: &Fast
         Color::Cyan,
     ];
     let mut i = 0;
-    for token in resolved.map(|t| std::str::from_utf8(&tokenizer.tokens[t as usize]).unwrap()) {
+    for token in
+        resolved.filter_map(|t| std::str::from_utf8(tokenizer.tokens.get(t as usize)?).ok())
+    {
         i = (i + 1) % colors.len();
         print!("{}", token.color(colors[i]));
     }

@@ -12,6 +12,19 @@ fn main() {
         tokenizer
     };
 
+    if let Some(file) = std::env::args().nth(1) {
+        let mut all_text = String::new();
+        for line in std::fs::read_to_string(file).unwrap().lines() {
+            all_text += line.trim();
+        }
+        loop {
+            let mut input_tokens = Vec::new();
+            let mut merge_queue = fast_bpe::MergeQueue::new();
+
+            let index = merge_queue.resolve(&mut input_tokens, &all_text, &tokenizer);
+        }
+    }
+
     loop {
         // read a line from stdin
         let mut line = String::new();
@@ -20,11 +33,10 @@ fn main() {
         std::io::stdin().read_line(&mut line).unwrap();
 
         let text = line.trim();
-        let bytes = text.as_bytes();
-        let mut input_tokens = vec![fast_bpe::TokenData::DEFAULT; bytes.len()].into_boxed_slice();
+        let mut input_tokens = Vec::new();
         let mut merge_queue = fast_bpe::MergeQueue::new();
 
-        let index = merge_queue.resolve(&mut input_tokens, bytes, &tokenizer);
+        let index = merge_queue.resolve(&mut input_tokens, text, &tokenizer);
         fast_bpe::pretty_print_tokens(
             input_tokens.iter().take(index).map(|t| t.token()),
             &tokenizer,

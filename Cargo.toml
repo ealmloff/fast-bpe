@@ -13,6 +13,8 @@ rustc-hash = "2.0.0"
 colored = "2.1.0"
 serde-big-array = "0.5.1"
 postcard = { version = "1.0.10", features = ["use-std"] }
+regex = { version = "1.10.6", features = ["perf-dfa-full"] }
+reqwest = { version = "0.12.7", features = ["blocking"] }
 
 [profile.release]
 lto = true
@@ -20,7 +22,6 @@ codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.3"
-rand = "0.8.5"
 tokenizers = "0.20.0"
 
 [[bench]]

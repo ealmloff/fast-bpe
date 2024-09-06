@@ -8,6 +8,7 @@ After pre-tokenization splitting, most inputs will be very small. FastBPE is abs
 
 ## Fast on giant inputs
 
-Even if you don't  pre-tokenize, FastBPE is takes linear time for any input size. This makes it very fast on giant inputs.
+Even if you don't pre-tokenize, FastBPE is takes linear time for any input size. This makes it very fast on giant inputs.
 
-![Screenshot 2024-09-05 at 8 01 44 PM](https://github.com/user-attachments/assets/948e1d36-8bdc-40b8-a19c-f7b56e0a03a9)
+![Screenshot 2024-09-05 at 8 25 21 PM](https://github.com/user-attachments/assets/e85df113-0c7a-4547-959f-df11c7ffd891)
+

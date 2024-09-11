@@ -21,7 +21,7 @@ fn main() {
 
         let text = line.trim();
         let mut input_tokens = Vec::new();
-        let mut merge_queue = fast_bpe::MergeQueue::new();
+        let mut merge_queue = fast_bpe::MergeLayerQueue::new();
 
         let index = merge_queue.resolve(&mut input_tokens, text, &tokenizer);
         fast_bpe::pretty_print_tokens(

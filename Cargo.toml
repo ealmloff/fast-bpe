@@ -15,10 +15,12 @@ serde-big-array = "0.5.1"
 postcard = { version = "1.0.10", features = ["use-std"] }
 regex = { version = "1.10.6", features = ["perf-dfa-full"] }
 reqwest = { version = "0.12.7", features = ["blocking"] }
+tracing = "0.1.40"
 
 [profile.release]
 lto = true
 codegen-units = 1
+# debug = true
 
 [dev-dependencies]
 criterion = "0.3"
